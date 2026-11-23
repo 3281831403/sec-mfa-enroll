@@ -17,6 +17,67 @@ device_id 不得同时绑定到两个用户，也不得重复写入。备用码�
 完全一致，且每个备用码只能消费一次。
 """
 
+import base64
+import hashlib
+import hmac
+
+_STORE_MISSING = object()
+
+
+def _is_positive_int(value) -> bool:
+    """正整数判定：布尔值不能冒充整数。"""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _entropy(store):
+    """取出调用方显式提供的熵源，缺失时视为配置错误。"""
+    entropy = store.get("entropy")
+    if not isinstance(entropy, (bytes, bytearray, str)):
+        raise ValueError("store must provide bytes entropy")
+    return entropy
+
+
+def _key(entropy) -> bytes:
+    if isinstance(entropy, str):
+        return entropy.encode("utf-8")
+    return bytes(entropy)
+
+
+def _digest(entropy, *parts) -> bytes:
+    """对 entropy 与显式上下文做 HMAC-SHA256，不读取时钟或随机源。"""
+    message = b"\x00".join(
+        part if isinstance(part, (bytes, bytearray)) else str(part).encode("utf-8")
+        for part in parts
+    )
+    return hmac.new(_key(entropy), message, hashlib.sha256).digest()
+
+
+def _hex_digest(entropy, *parts) -> str:
+    return _digest(entropy, *parts).hex()
+
+
+def _devices_of(store, user_id):
+    """只读地取某个用户的设备表，不因查询而创建空表。"""
+    devices = store.get("devices")
+    if not isinstance(devices, dict):
+        return {}
+    records = devices.get(user_id)
+    return records if isinstance(records, dict) else {}
+
+
+def _active_device_exists(store, device_id) -> bool:
+    """device_id 是否已作为启用设备绑定到任何用户。"""
+    devices = store.get("devices")
+    if not isinstance(devices, dict):
+        return False
+    for records in devices.values():
+        if not isinstance(records, dict):
+            continue
+        record = records.get(device_id)
+        if record is not None and record.get("active") is True:
+            return True
+    return False
+
 
 def begin(store, user, now) -> dict:
     """开始绑定，生成带过期时间的待确认记录。
@@ -31,7 +92,41 @@ def begin(store, user, now) -> dict:
     待确认记录，必须抛出 ValueError。可用设备数为 0 时也不得创建记录。成功时
     返回刚写入的待确认记录，其中 code 是用户完成确认所需的明文挑战码。
     """
-    raise NotImplementedError
+    user_id = user["id"]
+    device_id = user["device_id"]
+    policy = store.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("policy must be a dict")
+    pending_ttl = policy.get("pending_ttl")
+    if not _is_positive_int(pending_ttl):
+        raise ValueError("pending_ttl must be a positive integer")
+
+    # 缺陷 2：同一设备不得同时绑定到任何用户。
+    if _active_device_exists(store, device_id):
+        raise ValueError("device is already bound")
+
+    pending = store.get("pending")
+    if isinstance(pending, dict):
+        existing = pending.get(user_id)
+        # 缺陷 1：只有真正过期的旧记录才允许被覆盖，且 now == expires_at 已过期。
+        if existing is not None and now < existing.get("expires_at", 0):
+            raise ValueError("user already has an unexpired pending enrollment")
+
+    if device_limit(store, user) <= 0:
+        raise ValueError("device limit reached")
+
+    code = _hex_digest(_entropy(store), "enroll-challenge", user_id, device_id, now)
+    record = {
+        "user_id": user_id,
+        "device_id": device_id,
+        "code": code,
+        "issued_at": now,
+        "expires_at": now + pending_ttl,
+    }
+    if not isinstance(pending, dict):
+        pending = store["pending"] = {}
+    pending[user_id] = record
+    return record
 
 
 def confirm(store, user, code, now) -> dict:
@@ -47,7 +142,47 @@ def confirm(store, user, code, now) -> dict:
     由 store["entropy"] 与用户、设备、时间派生的 64 位小写十六进制值。最后删除
     待确认记录，返回新设备记录。重复确认同一待确认记录必须失败。
     """
-    raise NotImplementedError
+    user_id = user["id"]
+    device_id = user["device_id"]
+    pending_store = store.get("pending")
+    pending = pending_store.get(user_id) if isinstance(pending_store, dict) else None
+    if pending is None:
+        raise ValueError("no pending enrollment")
+
+    expected_code = pending.get("code")
+    if (
+        not isinstance(code, str)
+        or not isinstance(expected_code, str)
+        or not hmac.compare_digest(code, expected_code)
+    ):
+        raise ValueError("invalid confirmation code")
+
+    # 缺陷 2：确认的设备必须与发起绑定的设备一致。
+    if device_id != pending.get("device_id"):
+        raise ValueError("confirmation device does not match enrollment")
+
+    # 缺陷 1：now 达到 expires_at 即拒绝，没有宽限。
+    if now >= pending.get("expires_at", 0):
+        raise ValueError("pending enrollment expired")
+
+    if _active_device_exists(store, device_id):
+        raise ValueError("device is already bound")
+    if device_limit(store, user) <= 0:
+        raise ValueError("device limit reached")
+
+    secret = _hex_digest(_entropy(store), "device-secret", user_id, device_id, now)
+    record = {
+        "device_id": device_id,
+        "bound_at": now,
+        "secret": secret,
+        "active": True,
+    }
+    devices = store.get("devices")
+    if not isinstance(devices, dict):
+        devices = store["devices"] = {}
+    devices.setdefault(user_id, {})[device_id] = record
+    del pending_store[user_id]
+    return record
 
 
 def device_limit(store, user) -> int:
@@ -58,7 +193,20 @@ def device_limit(store, user) -> int:
     返回 0，绝不返回负数。也就是说达到上限必须立即拒绝，不能因为使用大于而
     多放行一台。max_devices 必须是正整数，否则抛出 ValueError。
     """
-    raise NotImplementedError
+    policy = store.get("policy")
+    max_devices = policy.get("max_devices") if isinstance(policy, dict) else None
+    if not _is_positive_int(max_devices):
+        raise ValueError("max_devices must be a positive integer")
+
+    active = sum(
+        1
+        for record in _devices_of(store, user["id"]).values()
+        if isinstance(record, dict) and record.get("active") is True
+    )
+    # 缺陷 3：K >= N 即返回 0，不能多放行一台。
+    if active >= max_devices:
+        return 0
+    return max_devices - active
 
 
 def revoke_device(store, user, device_id) -> dict:
@@ -74,7 +222,42 @@ def revoke_device(store, user, device_id) -> dict:
     sessions_invalidated、session_layer_notified。device_id 不存在或已经撤销
     时抛出 ValueError。
     """
-    raise NotImplementedError
+    user_id = user["id"]
+    record = _devices_of(store, user_id).get(device_id)
+    if not isinstance(record, dict):
+        raise ValueError("device not found")
+    if record.get("revoked") is True:
+        raise ValueError("device already revoked")
+
+    # 缺陷 4：真正清空密钥，旧密钥不能再通过校验。
+    record["active"] = False
+    record["secret"] = None
+    record["revoked"] = True
+
+    invalidated = 0
+    sessions = store.get("sessions")
+    if isinstance(sessions, dict):
+        for session in sessions.values():
+            if not isinstance(session, dict):
+                continue
+            # 缺陷 10：撤销后立即通知会话层，把该设备的活动会话全部作废。
+            if (
+                session.get("user_id") == user_id
+                and session.get("device_id") == device_id
+                and session.get("active") is True
+            ):
+                session["active"] = False
+                session["revoked"] = True
+                invalidated += 1
+
+    return {
+        "user_id": user_id,
+        "device_id": device_id,
+        "revoked": True,
+        "secret_cleared": True,
+        "sessions_invalidated": invalidated,
+        "session_layer_notified": True,
+    }
 
 
 def backup_codes(user, entropy, count) -> list:
@@ -91,7 +274,33 @@ def backup_codes(user, entropy, count) -> list:
     生成过程只使用调用方传入的 entropy，不读取系统时钟、不使用随机源。数量、
     唯一性和哈希存储三项都必须精确满足。
     """
-    raise NotImplementedError
+    if not _is_positive_int(count):
+        raise ValueError("count must be a positive integer")
+
+    user_id = user["id"]
+    codes = []
+    seen = set()
+    counter = 0
+    # 缺陷 7：碰撞时继续派生，直到恰好拿到 count 个互不重复的码。
+    while len(codes) < count:
+        candidate = base64.b32encode(
+            _digest(entropy, "backup-code", user_id, counter)
+        ).decode("ascii")[:10]
+        counter += 1
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        codes.append(candidate)
+
+    records = []
+    for index, code in enumerate(codes):
+        salt = _hex_digest(entropy, "backup-salt", user_id, index)[:16]
+        # 缺陷 5：只保存哈希，明文码绝不落入 user 记录。
+        code_hash = hashlib.sha256((salt + code).encode("utf-8")).hexdigest()
+        records.append({"salt": salt, "code_hash": code_hash, "used": False})
+
+    user["backup_codes"] = records
+    return codes
 
 
 def use_backup_code(store, user, code) -> bool:
@@ -105,7 +314,26 @@ def use_backup_code(store, user, code) -> bool:
     已消费的记录不得再次匹配，同一个码第二次调用必须返回 False；未匹配返回
     False。消费记录必须落在 user 与 store 中，不能只放在模块级临时变量里。
     """
-    raise NotImplementedError
+    if not isinstance(code, str):
+        return False
+
+    for record in user.get("backup_codes", []):
+        if not isinstance(record, dict):
+            continue
+        # 缺陷 6：已消费的记录不得再次参与匹配。
+        if record.get("used"):
+            continue
+        salt = record.get("salt", "")
+        code_hash = record.get("code_hash", "")
+        candidate = hashlib.sha256((salt + code).encode("utf-8")).hexdigest()
+        if hmac.compare_digest(candidate, code_hash):
+            record["used"] = True
+            redemptions = store.get("backup_redemptions")
+            if not isinstance(redemptions, list):
+                redemptions = store["backup_redemptions"] = []
+            redemptions.append({"user_id": user["id"], "code_hash": code_hash})
+            return True
+    return False
 
 
 def validate_policy(policy) -> list[str]:
@@ -121,7 +349,18 @@ def validate_policy(policy) -> list[str]:
     设备数上限必须被显式检查，不能只检查备用码与过期时间。全部合法时返回空
     列表。布尔值不能冒充整数上限。
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict):
+        return ["invalid_policy"]
+
+    problems = []
+    # 缺陷 8：设备数上限是必填安全项，必须显式校验。
+    if not _is_positive_int(policy.get("max_devices")):
+        problems.append("device_limit_missing")
+    if policy.get("backup_codes") is not True:
+        problems.append("backup_codes_disabled")
+    if not _is_positive_int(policy.get("pending_ttl")):
+        problems.append("pending_ttl_missing")
+    return problems
 
 
 def enroll_batch(events, policy, now) -> dict:
@@ -135,4 +374,16 @@ def enroll_batch(events, policy, now) -> dict:
     每个事件必须使用自己的 store 与 user；即使多个事件共享同一个 store，也必须
     按 user["id"] 分别写入待确认记录，不能共用一个局部 pending 变量。
     """
-    raise NotImplementedError
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("invalid policy: " + ", ".join(problems))
+
+    results = {}
+    for event in events:
+        event_id = event["id"]
+        try:
+            # 缺陷 9：每个事件使用自己的 store 与 user，按用户 id 分别落库。
+            results[event_id] = begin(event["store"], event["user"], now)
+        except ValueError as exc:
+            results[event_id] = exc
+    return results
